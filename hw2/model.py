@@ -8,6 +8,7 @@ n_head = 4  # Number of attention heads
 n_layer = 4  # Number of transformer blocks
 dropout = 0.0  
 block_size = 32  # Maximum context length for predictions
+num_kv_groups = 2
 
 
 
@@ -28,9 +29,8 @@ def precompute_rope_embeddings(dim, seq_len, device, theta=10000.0):
     return freqs_cis
 
 def apply_rope(x, freqs_cis):
-    # x: input tensor (Batch, NumHeads, SeqLen, HeadDim)
+    # x:(Batch, NumHeads, SeqLen, HeadDim)
     # freqs_cis: precomputed cos/sin pairs (SeqLen, HeadDim // 2)
-    # Reshape x to treat real and imaginary parts for complex multiplication
     # x_grouped : (Batch, NumHeads, SeqLen, HeadDim // 2, 2)
     x_grouped = x.float().reshape(*x.shape[:-1], -1, 2)
     # x_complex: (Batch, NumHeads, SeqLen, HeadDim // 2)
@@ -60,18 +60,24 @@ class RMSNorm(nn.Module):
         output = self._norm(x)
         return output * self.gamma
 
-class MultiHeadAttention(nn.Module):
+class GroupQueryAttention(nn.Module):
     """ multiple heads of self-attention in parallel """
-    def __init__(self, num_heads, head_size, n_embd, block_size, device):
+    def __init__(self, n_embd, num_q_heads,num_kv_groups, head_size, block_size, device):
         super().__init__()
-        self.num_heads = num_heads
+        assert num_q_heads % num_q_heads == 0
+        assert n_embd % num_q_heads == 0
+
+        self.num_q_heads = num_q_heads
+        self.num_kv_groups = num_kv_groups
         self.head_size = head_size
         self.n_embd = n_embd #  (num_heads * head_size)
 
-        self.q_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.k_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.v_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.out_proj = nn.Linear(self.n_embd, self.n_embd)
+        #out feature_size (nums_head * head_dim)
+        self.q_proj = nn.Linear(self.n_embd, self.num_q_heads * self.head_size, bias=False)
+        #k v out shape(nums_key_value_head * head_dim)
+        self.k_proj = nn.Linear(self.n_embd, self.num_kv_groups * self.head_size, bias=False)
+        self.v_proj = nn.Linear(self.n_embd, self.num_kv_groups * self.head_size, bias=False)
+        self.out_proj = nn.Linear(self.num_q_heads * self.head_size, self.n_embd)
         self.dropout = nn.Dropout(dropout)
         self.register_buffer(
             "freqs_cis", 
@@ -89,19 +95,24 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(x) 
         v = self.v_proj(x) 
 
-        #(Batch, Block_size, n_embd) ->  (Batch, Block_size, num_heads, head_size)
-        #(Batch, Block_size, num_heads, head_size) -> (Batch, num_heads, Block_size, head_size)
-        q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        k = k.view(B, T, self.num_heads, self.head_size).transpose(1, 2) 
-        v = v.view(B, T, self.num_heads, self.head_size).transpose(1, 2) 
+        q = q.view(B, T, self.num_q_heads, self.head_size).transpose(1, 2)
+        k = k.view(B, T, self.num_kv_groups, self.head_size).transpose(1, 2) 
+        v = v.view(B, T, self.num_kv_groups, self.head_size).transpose(1, 2) 
 
         # (seq_len, head_size // 2)
         current_freqs_cis = self.freqs_cis[:T]
         
         q_rope = apply_rope(q, current_freqs_cis)
         k_rope = apply_rope(k, current_freqs_cis)
+
+        #Repeat K,V heads
+        num_repeats = self.num_q_heads // self.num_kv_groups
+        # (B, num_q_heads, T, head_size)
+        k_rope_repeated = k_rope.repeat_interleave(num_repeats,dim=1)
+        # (B, num_q_heads, T, head_size)
+        v_repeated = v.repeat_interleave(num_repeats,dim=1)
         
-        wei = q_rope @ k_rope.transpose(-2, -1) * (self.head_size ** -0.5)
+        wei = q_rope @ k_rope_repeated.transpose(-2, -1) * (self.head_size ** -0.5)
         
         #mask
         tril_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
@@ -110,8 +121,10 @@ class MultiHeadAttention(nn.Module):
         att_probs = F.softmax(wei, dim=-1)
         att_probs = self.dropout(att_probs)
         
-        out = att_probs @ v # (B, num_heads, T, head_size)
-        out = out.transpose(1, 2).reshape(B, T, self.n_embd) # (B, T, n_embd)
+        # (B, num_q_heads, T, head_size)
+        out = att_probs @ v_repeated 
+        # (B, T, n_embd_q_heads_dim)
+        out = out.transpose(1, 2).reshape(B, T, self.num_q_heads * self.head_size)
         out = self.out_proj(out)
         return out
 
@@ -130,10 +143,10 @@ class FeedForward(nn.Module):
 
 class Block(nn.Module):
     """ Transformer block: communication followed by computation """
-    def __init__(self, n_embd, n_head, device): 
+    def __init__(self, n_embd, n_head,num_kv_group, device): 
         super().__init__()
         head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size, n_embd, block_size, device) 
+        self.sa = GroupQueryAttention(n_embd,n_head,num_kv_group, head_size, block_size, device) 
         self.ffwd = FeedForward(n_embd)
         self.ln1 = RMSNorm(n_embd)
         self.ln2 = RMSNorm(n_embd)
@@ -150,10 +163,10 @@ class BigramLanguageModel(nn.Module):
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         # self.position_embedding_table = nn.Embedding(block_size, n_embd) 
         self.blocks = nn.Sequential(
-            *[Block(n_embd, n_head, self.device) for _ in range(n_layer)] # Pass self.device to Block
+            *[Block(n_embd, n_head,num_kv_groups,self.device) for _ in range(n_layer)] # Pass self.device to Block
         )
-        self.ln_f = RMSNorm(n_embd) # Uses global n_embd
-        self.lm_head = nn.Linear(n_embd, vocab_size) # Uses global n_embd
+        self.ln_f = RMSNorm(n_embd) 
+        self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
